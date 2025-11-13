@@ -525,35 +525,59 @@ else:
     st.bar_chart(probs_df['prob'])
 
     # performance chart: combine realized segments
-    st.markdown("### Portfolio performance per realized segment (Smart vs 1/N)")
-    perf_df = pd.DataFrame()
+    st.markdown("### Portfolio performance — cumulative (Smart vs 1/N)")
+    
+    # Build continuous cumulative curves
+    smart_log_series = []
+    naive_log_series = []
+    
     for i, e in enumerate(st.session_state.history):
         prices = e['price_df']
         if prices is None or prices.shape[0] == 0:
             continue
+    
         start_dt = e['date']
+    
+        # End date is the next rebalance OR current data end
         if i+1 < len(st.session_state.history):
             end_dt = st.session_state.history[i+1]['date']
         else:
             end_dt = prices.index[-1]
+    
         returns_all = compute_log_returns(prices)
+    
+        # Strict realized window
         interval = returns_all.loc[(returns_all.index > start_dt) & (returns_all.index <= end_dt)]
         if interval.shape[0] == 0:
             continue
+    
+        # Compute daily returns
         w_smart = e['weights_smart'].reindex(interval.columns).fillna(0.0)
         w_naive = e['weights_naive'].reindex(interval.columns).fillna(0.0)
+    
         smart_daily = interval.dot(w_smart)
         naive_daily = interval.dot(w_naive)
-        smart_cum = compute_cumulative_from_daily(smart_daily)
-        naive_cum = compute_cumulative_from_daily(naive_daily)
-        perf_df = pd.concat([perf_df, pd.DataFrame({
-            f"Smart_{i+1}": smart_cum,
-            f"Naive_{i+1}": naive_cum
-        })], axis=1)
-    if perf_df.shape[1] > 0:
-        st.line_chart(perf_df.fillna(method='ffill').fillna(0))
+    
+        smart_log_series.append(smart_daily)
+        naive_log_series.append(naive_daily)
+    
+    # Combine all daily log returns
+    if len(smart_log_series) > 0:
+        smart_all = pd.concat(smart_log_series).sort_index()
+        naive_all = pd.concat(naive_log_series).sort_index()
+    
+        smart_cum = np.exp(smart_all.cumsum()) - 1
+        naive_cum = np.exp(naive_all.cumsum()) - 1
+    
+        perf_df = pd.DataFrame({
+            'Smart': smart_cum,
+            'Naive': naive_cum
+        })
+    
+        st.line_chart(perf_df)
     else:
-        st.info("No realized periods yet to plot (advance time after a rebalance).")
+        st.info("No realized periods yet to plot.")
+
 
     # Pearson correlations
     st.markdown("### Pearson correlation: predicted μ vs actual asset realized returns")
