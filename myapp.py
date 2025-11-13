@@ -549,7 +549,7 @@ else:
     last = st.session_state.history[-1]
     probs = last['regime_probs']
     probs_df = pd.DataFrame.from_dict(probs, orient='index', columns=['prob']).reindex(["Bear","Calm","Bull"]).fillna(0.0)
-    st.table(probs_df.style.format({'prob': "{:.2%}'}))
+    st.table(probs_df.style.format({'prob': "{:.2%}"}))
     st.bar_chart(probs_df['prob'])
 
     # -------------------------
