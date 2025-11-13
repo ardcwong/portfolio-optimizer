@@ -28,6 +28,7 @@ def fetch_index_series(ticker, start, end):
     try:
         t = yf.Ticker(ticker)
         s = t.history(start=start, end=end)['Close'].dropna()
+        s.index = s.index.tz_localize(None)
         if s.empty and ticker.upper() == "^GSPC":
             # fallback to SPY
             t2 = yf.Ticker("SPY")
@@ -46,6 +47,9 @@ def fetch_prices(tickers, start, end, auto_adjust=True):
     if isinstance(tickers, str):
         tickers = [tickers]
     df = yf.download(tickers, start=start, end=end, progress=False, auto_adjust=auto_adjust)
+    # Convert tz-aware index to tz-naive (remove timezone)
+    df.index = df.index.tz_localize(None)
+
     if isinstance(df, pd.DataFrame) and 'Close' in df.columns:
         df = df['Close']
     if isinstance(df, pd.Series):
