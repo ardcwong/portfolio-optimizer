@@ -1,12 +1,12 @@
 # Core packages
-streamlit
+streamlit==1.39.0
 pandas==2.2.3
 numpy==1.26.4
 yfinance==0.2.66
 
 # Machine learning & statistics
-scikit-learn==1.6.1
-scipy==1.16.3
+scikit-learn==1.5.2
+scipy==1.13.1
 
 # Visualization
 matplotlib==3.9.2
