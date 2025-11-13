@@ -243,8 +243,8 @@ st.title("Smart Framework — GMM (μ,σ) + PCA Denoised Covariance (Full Simula
 
 with st.sidebar:
     st.header("Controls")
-    index_ticker = st.text_input("Index ticker (GMM)", value="^GSPC")
-    default_date = pd.to_datetime("2024-01-01")
+    index_ticker = "^GSPC"# st.text_input("Index ticker (GMM)", value="^GSPC")
+    default_date = pd.to_datetime("2025-01-01")
     current_date_input = st.date_input("Current analysis date", value=default_date.date())
     risk_appetite = st.slider("Risk appetite (1 Aggressive → 10 Conservative)", 1, 10, 5)
     budget_input = st.number_input("Budget", min_value=100.0, value=100000.0, step=100.0, format="%.2f")
@@ -372,62 +372,97 @@ with col1:
             prev_date = st.session_state.current_date
             new_date = prev_date + delta
             st.session_state.current_date = new_date
-    
+
             st.info(f"Advanced date to {new_date.date()}")
-    
+
             # Get last rebalance record
             last = st.session_state.history[-1]
             tickers = last['assets']
-    
-            # 🔥 NEW: download fresh price data for realized window
+
+            # 🔥 Download fresh price data for realized window
+            # include new_date by adding 1 day to end (yfinance end is exclusive in some cases)
+            fresh_end = (new_date + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+            fresh_start = last['date'].strftime("%Y-%m-%d")
+
             fresh_prices = fetch_prices(
                 tickers=tickers,
-                start=last['date'],
-                end=new_date,
+                start=fresh_start,
+                end=fresh_end,
                 auto_adjust=True
             )
-    
-            # Fix timezone
-            fresh_prices.index = fresh_prices.index.tz_localize(None)
-    
-            # Compute realized returns
-            fresh_rets = compute_log_returns(fresh_prices)
-    
-            if fresh_rets.shape[0] == 0:
+
+            # If fetch_prices returns a MultiIndex or DataFrame with columns level, handle 'Close' extraction already done in fetch_prices
+            # Ensure tz-naive index (fetch_prices already localizes but be defensive)
+            if hasattr(fresh_prices.index, "tz"):
+                try:
+                    fresh_prices.index = fresh_prices.index.tz_localize(None)
+                except Exception:
+                    # if already naive, ignore
+                    pass
+
+            # forward-fill and drop columns with no data
+            fresh_prices = fresh_prices.ffill().dropna(how='all')
+
+            if fresh_prices.shape[0] == 0:
                 st.warning("No new price data found between rebalance & new date.")
             else:
-                # Compute realized P&L
-                w_smart = last['weights_smart']
-                w_naive = last['weights_naive']
-    
-                smart_daily = fresh_rets.dot(w_smart)
-                naive_daily = fresh_rets.dot(w_naive)
-    
-                realized_log_smart = smart_daily.sum()
-                realized_log_naive = naive_daily.sum()
-    
-                realized_return_smart = np.expm1(realized_log_smart)
-                realized_return_naive = np.expm1(realized_log_naive)
-    
-                realized_vol_smart = smart_daily.std() * np.sqrt(TRADING_DAYS)
-                realized_vol_naive = naive_daily.std() * np.sqrt(TRADING_DAYS)
-    
-                sharpe_smart = realized_return_smart / (realized_vol_smart + 1e-12)
-                sharpe_naive = realized_return_naive / (realized_vol_naive + 1e-12)
-    
-                # Save realized performance into history
-                last['realized_return_smart'] = realized_return_smart
-                last['realized_return_naive'] = realized_return_naive
-                last['realized_vol_smart'] = realized_vol_smart
-                last['realized_vol_naive'] = realized_vol_naive
-                last['sharpe_smart'] = sharpe_smart
-                last['sharpe_naive'] = sharpe_naive
-    
-                # Update budget
-                st.session_state.budget *= (1 + realized_return_smart)
-    
-                st.success(f"Realized smart return = {realized_return_smart:.2%}")
-                st.success(f"New budget = ${st.session_state.budget:,.2f}")
+                # Merge fresh_prices into stored price_df so history contains full up-to-date series
+                # Combine the original stored frame and fresh_prices (fresh_prices may overlap existing rows)
+                old_prices = last.get('price_df')
+                if old_prices is None or old_prices.shape[0] == 0:
+                    combined_prices = fresh_prices.copy()
+                else:
+                    # concatenate and keep unique index, prefer fresh_prices values for overlapping dates
+                    combined = pd.concat([old_prices, fresh_prices])
+                    combined = combined[~combined.index.duplicated(keep='last')].sort_index()
+                    combined_prices = combined.copy()
+
+                # Save combined (tz-naive ensured)
+                combined_prices.index = combined_prices.index.tz_localize(None) if hasattr(combined_prices.index, "tz") else combined_prices.index
+                last['price_df'] = combined_prices
+
+                # Compute realized returns using fresh window (strictly > last['date'] and <= new_date)
+                returns_all = compute_log_returns(combined_prices)
+                realized_window = returns_all.loc[(returns_all.index > last['date']) & (returns_all.index <= new_date)]
+
+                if realized_window.shape[0] == 0:
+                    st.warning("No return rows found in the realized window after merging fresh data.")
+                else:
+                    # Compute realized P&L
+                    w_smart = last['weights_smart']
+                    w_naive = last['weights_naive']
+
+                    smart_daily = realized_window.dot(w_smart.reindex(realized_window.columns).fillna(0.0))
+                    naive_daily = realized_window.dot(w_naive.reindex(realized_window.columns).fillna(0.0))
+
+                    realized_log_smart = float(smart_daily.sum())
+                    realized_log_naive = float(naive_daily.sum())
+
+                    realized_return_smart = np.expm1(realized_log_smart)
+                    realized_return_naive = np.expm1(realized_log_naive)
+
+                    realized_vol_smart = float(smart_daily.std() * math.sqrt(TRADING_DAYS))
+                    realized_vol_naive = float(naive_daily.std() * math.sqrt(TRADING_DAYS))
+
+                    sharpe_smart = realized_return_smart / (realized_vol_smart + 1e-12) if realized_vol_smart > 0 else np.nan
+                    sharpe_naive = realized_return_naive / (realized_vol_naive + 1e-12) if realized_vol_naive > 0 else np.nan
+
+                    # Save realized performance into history record
+                    last['realized_return_smart'] = realized_return_smart
+                    last['realized_return_naive'] = realized_return_naive
+                    last['realized_vol_smart'] = realized_vol_smart
+                    last['realized_vol_naive'] = realized_vol_naive
+                    last['sharpe_smart'] = sharpe_smart
+                    last['sharpe_naive'] = sharpe_naive
+
+                    # Update budget using smart framework realized return
+                    prev_budget = st.session_state.budget
+                    new_budget = prev_budget * (1 + realized_return_smart)
+                    st.session_state.budget = float(max(new_budget, 0.0))
+
+                    st.success(f"Realized smart return = {realized_return_smart:.2%}")
+                    st.success(f"New budget = ${st.session_state.budget:,.2f}")
+
 
 
 with col2:
