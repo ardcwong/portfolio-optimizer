@@ -449,15 +449,21 @@ else:
             'sharpe_naive': e.get('sharpe_naive'),
         })
     summary_df = pd.DataFrame(rows).set_index('idx')
+    def fmt_percent(x):
+        return f"{x:.2%}" if pd.notnull(x) else ""
+
+    def fmt_float(x):
+        return f"{x:.3f}" if pd.notnull(x) else ""
+
     st.dataframe(summary_df.style.format({
-        'forecast_return': "{:.2%}",
-        'forecast_vol': "{:.2%}",
-        'realized_return_smart': lambda x: f"{x:.2%}" if pd.notnull(x) else "",
-        'realized_vol_smart': lambda x: f"{x:.2%}" if pd.notnull(x) else "",
-        'realized_return_naive': lambda x: f"{x:.2%}" if pd.notnull(x) else "",
-        'realized_vol_naive': lambda x: f"{x:.2%}" if pd.notnull(x) else "",
-        'sharpe_smart': "{:.3f}",
-        'sharpe_naive': "{:.3f}"
+        'forecast_return': fmt_percent,
+        'forecast_vol': fmt_percent,
+        'realized_return_smart': fmt_percent,
+        'realized_vol_smart': fmt_percent,
+        'realized_return_naive': fmt_percent,
+        'realized_vol_naive': fmt_percent,
+        'sharpe_smart': fmt_float,
+        'sharpe_naive': fmt_float,
     }))
 
     # display last regime probs
