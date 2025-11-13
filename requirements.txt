@@ -1,6 +1,6 @@
 # Core packages
 streamlit==1.39.0
-pandas==2.2.3
+pandas==2.2.2
 numpy==1.26.4
 yfinance==0.2.66
 
