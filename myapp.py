@@ -35,6 +35,7 @@ def run_step_0_gmm(index_ticker, start_date, end_date, vol_window, n_components)
     calm_label = [x for x in regime_stats_return.index if x not in [bear_label, bull_label]][0]
 
     regime_map = {bear_label: "Bear", bull_label: "Bull", calm_label: "Calm"}
+    historical_regime_labels = features['regime'].map(regime_map)
     features['Regime Name'] = features['regime'].map(regime_map)
 
     current_feat = scaled_features[-1].reshape(1, -1)
@@ -147,7 +148,7 @@ if st.sidebar.button("🚀 Run Smart Framework"):
 
     with st.spinner("Fetching stock data and computing inputs..."):
         mu, Sigma_noisy, sigma_vector, filtered_returns = run_step_1_get_inputs(
-            selected_stocks, start_date, end_date, use_gmm=True, current_regime=current_regime, hist_labels=gmm_features["Regime Name"]
+            selected_stocks, start_date, end_date, use_gmm=True, current_regime=current_regime, hist_labels=historical_regime_labels
         )
 
     with st.spinner("Applying PCA denoising..."):
