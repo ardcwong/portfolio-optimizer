@@ -42,7 +42,7 @@ def run_step_0_gmm(index_ticker, start_date, end_date, vol_window, n_components)
     scaled_current_features = scaler.transform(current_features)
     
     current_regime_label = gmm.predict(scaled_current_features)[0]
-    current_regime_name = regime_map.get[current_regime_label, "Unknown"]
+    current_regime_name = regime_map.get(current_regime_label, "Unknown")
     current_regime_probs = dict(zip(["Bear", "Calm", "Bull"], probs[-1]))
 
     return current_regime_name, current_regime_probs, features, historical_regime_labels, regime_map
