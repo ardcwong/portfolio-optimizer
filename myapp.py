@@ -364,57 +364,70 @@ col1, col2 = st.columns([1,1])
 with col1:
     if st.button("Advance time"):
         if len(st.session_state.history) == 0:
-            st.warning("No rebalance history to realize. Run Smart Framework first.")
+            st.warning("No rebalance yet. Click 'Run Smart Framework' first.")
         else:
-            # compute new date
+            # Advance date
             delta = pd.DateOffset(months=1) if advance_period == "1 month" else pd.DateOffset(months=3)
-            prev = st.session_state.current_date
-            new_dt = prev + delta
-            st.session_state.current_date = new_dt
-            st.info(f"Advanced date to {new_dt.date()}")
-
-            # compute realized for last record
+            prev_date = st.session_state.current_date
+            new_date = prev_date + delta
+            st.session_state.current_date = new_date
+    
+            st.info(f"Advanced date to {new_date.date()}")
+    
+            # Get last rebalance record
             last = st.session_state.history[-1]
-            price_df = last['price_df']
-            reb_date = last['date']
-            # realized window: >reb_date and <= new_dt
-            mask = (price_df.index > reb_date) & (price_df.index <= new_dt)
-            window_prices = price_df.loc[mask]
-            if window_prices.shape[0] == 0:
-                st.warning("No price data in advanced window; cannot compute realized returns.")
+            tickers = last['assets']
+    
+            # 🔥 NEW: download fresh price data for realized window
+            fresh_prices = fetch_prices(
+                tickers=tickers,
+                start=last['date'],
+                end=new_date,
+                auto_adjust=True
+            )
+    
+            # Fix timezone
+            fresh_prices.index = fresh_prices.index.tz_localize(None)
+    
+            # Compute realized returns
+            fresh_rets = compute_log_returns(fresh_prices)
+    
+            if fresh_rets.shape[0] == 0:
+                st.warning("No new price data found between rebalance & new date.")
             else:
-                returns_all = compute_log_returns(price_df)
-                realized_window = returns_all.loc[(returns_all.index > reb_date) & (returns_all.index <= new_dt)]
-                if realized_window.shape[0] == 0:
-                    st.warning("No return rows in realized window.")
-                else:
-                    w_smart = last['weights_smart'].reindex(realized_window.columns).fillna(0.0)
-                    w_naive = last['weights_naive'].reindex(realized_window.columns).fillna(0.0)
-                    smart_daily = realized_window.dot(w_smart)
-                    naive_daily = realized_window.dot(w_naive)
-                    # sum log returns -> log cumulative
-                    realized_log_smart = float(smart_daily.sum())
-                    realized_return_smart = math.expm1(realized_log_smart)
-                    realized_vol_smart = float(smart_daily.std() * math.sqrt(TRADING_DAYS))
-                    realized_log_naive = float(naive_daily.sum())
-                    realized_return_naive = math.expm1(realized_log_naive)
-                    realized_vol_naive = float(naive_daily.std() * math.sqrt(TRADING_DAYS))
-                    sharpe_smart = realized_return_smart / (realized_vol_smart + 1e-12) if realized_vol_smart > 0 else np.nan
-                    sharpe_naive = realized_return_naive / (realized_vol_naive + 1e-12) if realized_vol_naive > 0 else np.nan
+                # Compute realized P&L
+                w_smart = last['weights_smart']
+                w_naive = last['weights_naive']
+    
+                smart_daily = fresh_rets.dot(w_smart)
+                naive_daily = fresh_rets.dot(w_naive)
+    
+                realized_log_smart = smart_daily.sum()
+                realized_log_naive = naive_daily.sum()
+    
+                realized_return_smart = np.expm1(realized_log_smart)
+                realized_return_naive = np.expm1(realized_log_naive)
+    
+                realized_vol_smart = smart_daily.std() * np.sqrt(TRADING_DAYS)
+                realized_vol_naive = naive_daily.std() * np.sqrt(TRADING_DAYS)
+    
+                sharpe_smart = realized_return_smart / (realized_vol_smart + 1e-12)
+                sharpe_naive = realized_return_naive / (realized_vol_naive + 1e-12)
+    
+                # Save realized performance into history
+                last['realized_return_smart'] = realized_return_smart
+                last['realized_return_naive'] = realized_return_naive
+                last['realized_vol_smart'] = realized_vol_smart
+                last['realized_vol_naive'] = realized_vol_naive
+                last['sharpe_smart'] = sharpe_smart
+                last['sharpe_naive'] = sharpe_naive
+    
+                # Update budget
+                st.session_state.budget *= (1 + realized_return_smart)
+    
+                st.success(f"Realized smart return = {realized_return_smart:.2%}")
+                st.success(f"New budget = ${st.session_state.budget:,.2f}")
 
-                    # update record
-                    last['realized_return_smart'] = realized_return_smart
-                    last['realized_vol_smart'] = realized_vol_smart
-                    last['realized_return_naive'] = realized_return_naive
-                    last['realized_vol_naive'] = realized_vol_naive
-                    last['sharpe_smart'] = sharpe_smart
-                    last['sharpe_naive'] = sharpe_naive
-
-                    # update budget
-                    prev_budget = st.session_state.budget
-                    new_budget = prev_budget * (1.0 + realized_return_smart)
-                    st.session_state.budget = float(max(new_budget, 0.0))
-                    st.success(f"Realized Smart return: {realized_return_smart:.2%}. New budget = {st.session_state.budget:,.2f}")
 
 with col2:
     if st.button("Rebalance now (use current budget)"):
