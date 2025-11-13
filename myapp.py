@@ -251,7 +251,8 @@ with st.sidebar:
     # You can customize this list with any universe you want
     default_universe = [
         "AAPL","MSFT","AMZN","GOOG","META","TSLA","NVDA","JPM","V","XOM",
-        "NFLX","ADBE","CRM","ORCL","INTC","AMD","BAC","WMT","DIS","CSCO"
+        "NFLX","ADBE","CRM","ORCL","INTC","AMD","BAC","WMT","DIS","CSCO",
+        "JNJ"
     ]
     
     tickers = st.multiselect(
