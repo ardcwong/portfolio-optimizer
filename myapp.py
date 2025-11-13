@@ -73,7 +73,7 @@ def run_step_0_gmm(index_ticker, gmm_start, gmm_end, vol_window=21, k=3):
 
     spx_ret = compute_log_returns(spx)
     # rolling features (use simple rolling on daily log returns)
-    mu_roll = spx_ret.rolling(vol_window).mean()
+    mu_roll = spx_ret# spx_ret.rolling(vol_window).mean()
     sigma_roll = spx_ret.rolling(vol_window).std() * math.sqrt(TRADING_DAYS)
     features = pd.concat([mu_roll, sigma_roll], axis=1).dropna()
     features.columns = ['mu', 'sigma']
@@ -265,9 +265,9 @@ with st.sidebar:
     if len(tickers) == 0:
         st.warning("Please select at least 1 stock.")
     
-    gmm_lookback_years = st.number_input("GMM lookback (years)", min_value=3, max_value=20, value=10)
-    stocks_lookback_years = st.number_input("Stock history lookback (years)", min_value=1, max_value=10, value=5)
-    rolling_window_days = st.number_input("Rolling window (days) for μ,σ", min_value=20, max_value=252, value=60)
+    gmm_lookback_years = 10 #st.number_input("GMM lookback (years)", min_value=3, max_value=20, value=10)
+    stocks_lookback_years = 5 # st.number_input("Stock history lookback (years)", min_value=1, max_value=10, value=5)
+    rolling_window_days = 21 # st.number_input("Rolling window (days) for μ,σ", min_value=20, max_value=252, value=60)
     advance_period = st.selectbox("Advance time by", ["1 month", "1 quarter (3 months)"])
     run_button = st.button("Run Smart Framework (Rebalance now)")
 
