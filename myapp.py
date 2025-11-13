@@ -1,4 +1,4 @@
-# app_v2.py
+# app_v3.py
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -6,12 +6,12 @@ import yfinance as yf
 from sklearn.mixture import GaussianMixture
 from sklearn.preprocessing import StandardScaler
 from scipy.optimize import minimize
-from datetime import timedelta
 import math
+from datetime import datetime
 import matplotlib.pyplot as plt
 import seaborn as sns
 
-st.set_page_config(page_title="Smart Framework v2", layout="wide")
+st.set_page_config(page_title="Smart Framework v3", layout="wide")
 sns.set_style("whitegrid")
 
 # -------------------------
@@ -20,103 +20,113 @@ sns.set_style("whitegrid")
 TRADING_DAYS = 252
 
 # -------------------------
-# Utility functions
+# Utility / Data fetchers
 # -------------------------
 @st.cache_data
 def fetch_index_series(ticker, start, end):
-    """Use .history() for index tickers to avoid yfinance quirks. Fallback to ticker 'SPY' if empty."""
+    """Use .history() for index tickers to avoid yfinance quirks. Fallback to SPY if needed."""
     try:
         t = yf.Ticker(ticker)
         s = t.history(start=start, end=end)['Close'].dropna()
-        s.index = s.index.tz_localize(None)
+        # make tz-naive
+        if hasattr(s.index, "tz"):
+            try:
+                s.index = s.index.tz_localize(None)
+            except Exception:
+                pass
         if s.empty and ticker.upper() == "^GSPC":
-            # fallback to SPY
             t2 = yf.Ticker("SPY")
             s = t2.history(start=start, end=end)['Close'].dropna()
+            if hasattr(s.index, "tz"):
+                try:
+                    s.index = s.index.tz_localize(None)
+                except Exception:
+                    pass
         return s
     except Exception:
-        # final fallback: try yf.download
         data = yf.download(ticker, start=start, end=end, progress=False)
-        if 'Close' in data:
-            return data['Close'].dropna()
+        if isinstance(data, pd.DataFrame) and 'Close' in data:
+            s = data['Close'].dropna()
+            if hasattr(s.index, "tz"):
+                try:
+                    s.index = s.index.tz_localize(None)
+                except Exception:
+                    pass
+            return s
         return pd.Series(dtype=float)
 
 @st.cache_data
 def fetch_prices(tickers, start, end, auto_adjust=True):
-    """Fetch adjusted close prices for multiple tickers."""
+    """Fetch adjusted close prices for tickers. Returns DataFrame (columns=tickers)."""
     if isinstance(tickers, str):
         tickers = [tickers]
     df = yf.download(tickers, start=start, end=end, progress=False, auto_adjust=auto_adjust)
-    # Convert tz-aware index to tz-naive (remove timezone)
-    df.index = df.index.tz_localize(None)
-
+    # convert tz-aware to tz-naive
+    if hasattr(df.index, "tz"):
+        try:
+            df.index = df.index.tz_localize(None)
+        except Exception:
+            pass
+    # prefer Close column if multi-level
     if isinstance(df, pd.DataFrame) and 'Close' in df.columns:
         df = df['Close']
     if isinstance(df, pd.Series):
         df = df.to_frame()
-    # forward-fill then drop leading NaNs per column
     df = df.ffill().dropna(how='all')
     return df
 
 def compute_log_returns(prices):
-    returns = np.log(prices / prices.shift(1))
-    return returns.dropna(how='all')
+    rets = np.log(prices / prices.shift(1))
+    return rets.dropna(how='all')
 
 # -------------------------
-# Step 0: GMM (2D features μ, σ)
+# Step 0: GMM (2D features)
 # -------------------------
-def run_step_0_gmm(index_ticker, gmm_start, gmm_end, vol_window=21, k=3):
+def run_step_0_gmm(index_ticker, gmm_start, gmm_end, vol_window=21, k=3, use_rolling_mu=False):
+    """Train GMM on index returns. use_rolling_mu False => use raw daily log returns for mu (keeps parity with original code)"""
     spx = fetch_index_series(index_ticker, gmm_start, gmm_end)
     if spx.empty:
         st.error(f"Could not fetch index {index_ticker}. Try 'SPY'.")
         return None
 
-    spx_ret = compute_log_returns(spx)
-    # rolling features (use simple rolling on daily log returns)
-    mu_roll = spx_ret# spx_ret.rolling(vol_window).mean()
+    spx_ret = compute_log_returns(spx)  # series
+    if use_rolling_mu:
+        mu_roll = spx_ret.rolling(vol_window).mean()
+    else:
+        mu_roll = spx_ret  # raw daily log return per original code
     sigma_roll = spx_ret.rolling(vol_window).std() * math.sqrt(TRADING_DAYS)
+
     features = pd.concat([mu_roll, sigma_roll], axis=1).dropna()
     features.columns = ['mu', 'sigma']
 
-    # scale features, fit GMM
     scaler = StandardScaler()
     X = scaler.fit_transform(features)
     gmm = GaussianMixture(n_components=k, covariance_type='full', random_state=42)
     gmm.fit(X)
-    comp_idx = gmm.predict(X)
-    probs = gmm.predict_proba(X)  # rows aligned to features.index
 
-    features = features.assign(component=comp_idx)
-    # compute component mean (in original mu space) for labeling
-    comp_means = pd.DataFrame(gmm.means_, columns=['mu_scaled', 'sigma_scaled'])
-    # To label by mu, we need mapping based on decoded means in original scale:
-    # inverse transform means
+    comp_idx = gmm.predict(X)
+    probs = gmm.predict_proba(X)
+
+    # label components by decoded mu (inverse scale)
     comp_means_orig = pd.DataFrame(scaler.inverse_transform(gmm.means_), columns=['mu', 'sigma'])
     order = np.argsort(comp_means_orig['mu'].values)  # ascending mu
-    # map indices to names
-    label_map = {}
     labels_sorted = ["Bear", "Calm", "Bull"]
-    for i, comp in enumerate(order):
-        label_map[comp] = labels_sorted[i] if i < len(labels_sorted) else f"Regime_{i+1}"
+    label_map = {comp: labels_sorted[i] if i < len(labels_sorted) else f"Regime_{i+1}" for i, comp in enumerate(order)}
 
-    # historical regime names (aligned to features.index)
     hist_labels = pd.Series(comp_idx, index=features.index).map(label_map)
 
-    # predict current features (most recent rolling mu & sigma)
     last_feat = features.iloc[[-1]][['mu', 'sigma']]
     last_scaled = scaler.transform(last_feat)
     cur_comp = int(gmm.predict(last_scaled)[0])
     cur_regime = label_map.get(cur_comp, "Unknown")
-    # get probabilities for the last row and map to regime names
-    last_probs = pd.Series(probs[-1], index=[label_map[i] for i in range(len(probs[-1]))])
-    # ensure ordering Bear/Calm/Bull
+
+    last_probs = pd.Series(probs[-1], index=[label_map.get(i, f"Comp_{i}") for i in range(len(probs[-1]))])
     probs_map = {name: float(last_probs.get(name, 0.0)) for name in ["Bear", "Calm", "Bull"]}
 
-    # return: current regime name, probs, features df, historical regime names, label_map, gmm/scaler for debug if needed
     return cur_regime, probs_map, features, hist_labels, label_map, gmm, scaler
 
 # -------------------------
-# Step 1: get stock inputs (regime-filtered mu and Sigma)
+# Step 1: inputs
 # -------------------------
 def run_step_1_get_inputs(tickers, start_date, end_date, use_gmm=True, current_regime=None, hist_labels=None):
     prices = fetch_prices(tickers, start_date, end_date, auto_adjust=True)
@@ -128,24 +138,21 @@ def run_step_1_get_inputs(tickers, start_date, end_date, use_gmm=True, current_r
         st.error("No returns available for selected tickers.")
         return None
 
+    used_fallback = False
     if use_gmm and current_regime is not None and hist_labels is not None:
-        # align labels to returns index (no dropna)
         aligned_labels = hist_labels.reindex(returns.index, method='ffill')
         mask = aligned_labels.eq(current_regime).fillna(False)
         filtered = returns.loc[mask]
-        used_fallback = False
         if filtered.shape[0] < 30:
-            # fallback
             filtered = returns.copy()
             used_fallback = True
     else:
         filtered = returns.copy()
-        used_fallback = False
 
     mu_daily = filtered.mean()
     mu_annual = mu_daily * TRADING_DAYS
     Sigma_noisy_daily = filtered.cov()
-    Sigma_noisy = Sigma_noisy_daily * TRADING_DAYS  # annualize
+    Sigma_noisy = Sigma_noisy_daily * TRADING_DAYS
 
     sigma_vec = pd.Series(np.sqrt(np.diag(Sigma_noisy)), index=Sigma_noisy.index)
     sigma_vec = sigma_vec.replace(0, 1e-8)
@@ -153,7 +160,7 @@ def run_step_1_get_inputs(tickers, start_date, end_date, use_gmm=True, current_r
     return mu_annual, Sigma_noisy, sigma_vec, filtered, prices, used_fallback
 
 # -------------------------
-# Step 2: PCA denoising (hybrid RMT / 90% var)
+# Step 2: PCA denoise (hybrid)
 # -------------------------
 def run_step_2_pca_denoise(Sigma_noisy, sigma_vector, filtered_returns, var_threshold=0.90):
     T = filtered_returns.shape[0]
@@ -161,34 +168,32 @@ def run_step_2_pca_denoise(Sigma_noisy, sigma_vector, filtered_returns, var_thre
     if T <= 1 or N == 0:
         return Sigma_noisy, 0, 0.0
 
-    # build correlation-like matrix P
     D_inv = np.diag(1 / sigma_vector)
     P = D_inv @ Sigma_noisy.values @ D_inv
-    # eigen
     vals, vecs = np.linalg.eigh(P)
     idx = np.argsort(vals)[::-1]
     vals = vals[idx]
     vecs = vecs[:, idx]
-    # RMT threshold (Marchenko-Pastur) using sigma2 = 1 here since P standardized
+
     q = N / T
     lambda_plus = (1 + math.sqrt(q))**2 if q > 0 else 0.0
     k_rmt = int(np.sum(vals > lambda_plus))
     if k_rmt == 0:
         k_rmt = 1
-    # 90% var
+
     cumvar = np.cumsum(vals) / np.sum(vals)
     k_var = int(np.searchsorted(cumvar, var_threshold) + 1)
     k_keep = max(k_rmt, k_var)
-    # reconstruct
-    vals_top = vals[:k_keep]
+
+    vals_top = vals[:k_keep].copy()
     vecs_top = vecs[:, :k_keep]
     P_cleaned = vecs_top @ np.diag(vals_top) @ vecs_top.T
+
     diag_pc = np.diag(P_cleaned).copy()
     diag_pc[diag_pc <= 0] = 1e-8
     Dp_inv = np.diag(1 / np.sqrt(diag_pc))
     P_cleaned = Dp_inv @ P_cleaned @ Dp_inv
 
-    # unscale
     D = np.diag(sigma_vector)
     Sigma_cleaned = D @ P_cleaned @ D
     Sigma_cleaned = pd.DataFrame(Sigma_cleaned, index=Sigma_noisy.index, columns=Sigma_noisy.columns)
@@ -201,8 +206,10 @@ def run_step_3_optimize(mu, Sigma, lambd):
     mu_arr = mu.values
     Sigma_arr = Sigma.values
     n = len(mu_arr)
+
     def obj(w):
         return - (w @ mu_arr - 0.5 * lambd * (w @ (Sigma_arr @ w)))
+
     cons = ({'type':'eq', 'fun': lambda w: np.sum(w) - 1},)
     bounds = tuple((0.0, 1.0) for _ in range(n))
     x0 = np.repeat(1.0 / n, n)
@@ -224,57 +231,45 @@ def run_step_3_optimize(mu, Sigma, lambd):
 # -------------------------
 # Portfolio helpers
 # -------------------------
-def compute_portfolio_daily_returns(weights, daily_returns):
-    # align weights to daily_returns columns
-    w = weights.reindex(daily_returns.columns).fillna(0.0)
-    port = daily_returns.dot(w)
-    return port
-
-def compute_cumulative_from_daily(daily_ret):
-    # daily_ret is log returns; convert to cumulative simple returns series
-    # sum logs to get log cumulative, then expm1
-    cum = np.exp(daily_ret.cumsum()) - 1.0
-    return cum
+def compute_cumulative_from_log(log_series):
+    return np.exp(log_series.cumsum()) - 1.0
 
 # -------------------------
 # UI & Session state init
 # -------------------------
-st.title("Smart Framework — GMM (μ,σ) + PCA Denoised Covariance (Full Simulation)")
+st.title("Smart Framework — v3 (Smart | GMM-only | PCA-only | Naive)")
 
 with st.sidebar:
     st.header("Controls")
-    index_ticker = "^GSPC"# st.text_input("Index ticker (GMM)", value="^GSPC")
-    default_date = pd.to_datetime("2025-01-01")
+    index_ticker = st.text_input("Index ticker (GMM)", value="^GSPC")
+    default_date = pd.to_datetime("2024-01-01")
     current_date_input = st.date_input("Current analysis date", value=default_date.date())
     risk_appetite = st.slider("Risk appetite (1 Aggressive → 10 Conservative)", 1, 10, 5)
     budget_input = st.number_input("Budget", min_value=100.0, value=100000.0, step=100.0, format="%.2f")
-    # You can customize this list with any universe you want
+
     default_universe = [
         "AAPL","MSFT","AMZN","GOOG","META","TSLA","NVDA","JPM","V","XOM",
         "NFLX","ADBE","CRM","ORCL","INTC","AMD","BAC","WMT","DIS","CSCO",
         "JNJ"
     ]
-    
     tickers = st.multiselect(
         "Select up to 10 stocks",
         options=default_universe,
         default=["AAPL", "MSFT", "AMZN"],
         max_selections=10
     )
-    
-    # Safety: If user selects nothing, block workflow
     if len(tickers) == 0:
         st.warning("Please select at least 1 stock.")
-    
-    gmm_lookback_years = 10 #st.number_input("GMM lookback (years)", min_value=3, max_value=20, value=10)
-    stocks_lookback_years = 5 # st.number_input("Stock history lookback (years)", min_value=1, max_value=10, value=5)
-    rolling_window_days = 21 # st.number_input("Rolling window (days) for μ,σ", min_value=20, max_value=252, value=60)
+
+    gmm_lookback_years = 10
+    stocks_lookback_years = 5
+    rolling_window_days = 21
     advance_period = st.selectbox("Advance time by", ["1 month", "1 quarter (3 months)"])
     run_button = st.button("Run Smart Framework (Rebalance now)")
 
-# initialize session state
+# session state
 if 'history' not in st.session_state:
-    st.session_state.history = []  # list of dicts recording each rebalance
+    st.session_state.history = []
 if 'current_date' not in st.session_state:
     st.session_state.current_date = pd.to_datetime(current_date_input)
 if 'budget' not in st.session_state:
@@ -282,192 +277,224 @@ if 'budget' not in st.session_state:
 if 'tickers' not in st.session_state:
     st.session_state.tickers = tickers
 
-# update session tickers if changed
 if tickers != st.session_state.tickers:
     st.session_state.tickers = tickers
 
 # -------------------------
-# Run pipeline (initial rebalance)
+# Pipeline & record function
 # -------------------------
-def run_pipeline_and_record(analysis_date, tickers, budget, risk_appetite):
+def run_pipeline_and_record(analysis_date, tickers_sel, budget, risk_appetite):
     gmm_start = (pd.to_datetime(analysis_date) - pd.DateOffset(years=int(gmm_lookback_years))).strftime("%Y-%m-%d")
     gmm_end = pd.to_datetime(analysis_date).strftime("%Y-%m-%d")
-    cur_regime, probs_map, features, hist_labels, label_map, gmm_model, scaler = run_step_0_gmm(index_ticker, gmm_start, gmm_end, vol_window=int(rolling_window_days), k=3)
+
+    cur_regime, probs_map, features, hist_labels, label_map, gmm_model, scaler = run_step_0_gmm(index_ticker, gmm_start, gmm_end, vol_window=int(rolling_window_days), k=3, use_rolling_mu=False)
     if cur_regime is None:
-        st.error("GMM failed. Aborting pipeline.")
+        st.error("GMM failed.")
         return None
 
-    # stock dates
     stocks_start = (pd.to_datetime(analysis_date) - pd.DateOffset(years=int(stocks_lookback_years))).strftime("%Y-%m-%d")
     stocks_end = pd.to_datetime(analysis_date).strftime("%Y-%m-%d")
-    mu, Sigma_noisy, sigma_vec, filtered_returns, price_df, used_fallback = run_step_1_get_inputs(st_session_tickers := st.session_state.tickers, stocks_start, stocks_end, use_gmm=True, current_regime=cur_regime, hist_labels=hist_labels)
-    if mu is None:
-        st.error("Failed to compute stock inputs.")
+
+    # Smart inputs: regime-filtered mu & then PCA-cleaned Sigma
+    mu_regime, Sigma_regime_noisy, sigma_vec_regime, filtered_returns, price_df, used_fallback = run_step_1_get_inputs(tickers_sel, stocks_start, stocks_end, use_gmm=True, current_regime=cur_regime, hist_labels=hist_labels)
+    if mu_regime is None:
+        st.error("Failed to get stock inputs.")
         return None
 
-    Sigma_cleaned, k_keep, lambda_plus = run_step_2_pca_denoise(Sigma_noisy, sigma_vec, filtered_returns, var_threshold=0.90)
+    Sigma_regime_cleaned, k_keep, lambda_plus = run_step_2_pca_denoise(Sigma_regime_noisy, sigma_vec_regime, filtered_returns, var_threshold=0.90)
+    w_smart, forecast_mu_smart, forecast_vol_smart = run_step_3_optimize(mu_regime, Sigma_regime_cleaned, lambd=float(risk_appetite))
 
-    # optimize
-    w_star, forecast_mu_port, forecast_vol_port = run_step_3_optimize(mu, Sigma_cleaned, lambd=float(risk_appetite))
-    # naive
-    assets = list(mu.index)
-    w_naive = pd.Series(np.repeat(1.0/len(assets), len(assets)), index=assets)
+    # GMM-only: regime-filtered mu but raw regime covariance (no PCA)
+    w_gmm_only, forecast_mu_gmm, forecast_vol_gmm = run_step_3_optimize(mu_regime, Sigma_regime_noisy, lambd=float(risk_appetite))
 
-    # allocations
-    allocation = (w_star * budget).round(2)
+    # PCA-only: full-history mu and PCA-cleaned full covariance (no GMM)
+    full_returns = compute_log_returns(price_df)
+    mu_full = full_returns.mean() * TRADING_DAYS
+    Sigma_full = full_returns.cov() * TRADING_DAYS
+    sigma_vec_full = pd.Series(np.sqrt(np.diag(Sigma_full)), index=Sigma_full.index).replace(0, 1e-8)
+    Sigma_full_cleaned, kf, lp = run_step_2_pca_denoise(Sigma_full, sigma_vec_full, full_returns, var_threshold=0.90)
+    w_pca_only, forecast_mu_pca, forecast_vol_pca = run_step_3_optimize(mu_full, Sigma_full_cleaned, lambd=float(risk_appetite))
+
+    # Naive 1/N
+    assets = list(mu_full.index)
+    w_naive = pd.Series(np.repeat(1.0 / len(assets), len(assets)), index=assets)
+
+    allocation = (w_smart * budget).round(2)
     allocation_naive = (w_naive * budget).round(2)
 
-    # prepare record
     record = {
         'date': pd.to_datetime(analysis_date),
         'predicted_regime': cur_regime,
         'regime_probs': probs_map,
         'used_fallback': used_fallback,
         'assets': assets,
-        'weights_smart': w_star,
+        'weights_smart': w_smart,
+        'weights_gmm_only': w_gmm_only,
+        'weights_pca_only': w_pca_only,
         'weights_naive': w_naive,
         'alloc_smart': allocation,
         'alloc_naive': allocation_naive,
-        'mu_annual': mu,
-        'Sigma_annual': Sigma_cleaned,
+        'mu_regime': mu_regime,
+        'Sigma_regime_noisy': Sigma_regime_noisy,
+        'Sigma_regime_cleaned': Sigma_regime_cleaned,
+        'mu_full': mu_full,
+        'Sigma_full': Sigma_full,
+        'Sigma_full_cleaned': Sigma_full_cleaned,
         'k_keep': k_keep,
         'lambda_plus': lambda_plus,
-        'forecast_port_mu': forecast_mu_port,
-        'forecast_port_vol': forecast_vol_port,
+        'forecast_port_mu_smart': forecast_mu_smart,
+        'forecast_port_vol_smart': forecast_vol_smart,
+        'forecast_port_mu_gmm': forecast_mu_gmm,
+        'forecast_port_vol_gmm': forecast_vol_gmm,
+        'forecast_port_mu_pca': forecast_mu_pca,
+        'forecast_port_vol_pca': forecast_vol_pca,
         'price_df': price_df,
         'filtered_returns': filtered_returns,
         # realized placeholders
         'realized_return_smart': None,
         'realized_vol_smart': None,
+        'realized_return_gmm_only': None,
+        'realized_vol_gmm_only': None,
+        'realized_return_pca_only': None,
+        'realized_vol_pca_only': None,
         'realized_return_naive': None,
         'realized_vol_naive': None,
         'sharpe_smart': None,
+        'sharpe_gmm_only': None,
+        'sharpe_pca_only': None,
         'sharpe_naive': None
     }
+
     st.session_state.history.append(record)
     return record
 
-# Bind run_button
+# -------------------------
+# Run initial rebalance
+# -------------------------
 if run_button:
-    # reset history on fresh run
     st.session_state.history = []
     st.session_state.current_date = pd.to_datetime(current_date_input)
     st.session_state.budget = float(budget_input)
-    st.success("Executing Smart Framework...")
+    st.success("Running Smart Framework...")
     rec = run_pipeline_and_record(st.session_state.current_date, st.session_state.tickers, st.session_state.budget, risk_appetite)
     if rec:
-        st.success("Rebalance completed and recorded.")
+        st.success("Rebalance computed and recorded.")
 
 # -------------------------
-# Advance time action
+# Advance time & realized returns
 # -------------------------
 col1, col2 = st.columns([1,1])
 with col1:
     if st.button("Advance time"):
         if len(st.session_state.history) == 0:
-            st.warning("No rebalance yet. Click 'Run Smart Framework' first.")
+            st.warning("No rebalance yet. Run Smart Framework first.")
         else:
-            # Advance date
             delta = pd.DateOffset(months=1) if advance_period == "1 month" else pd.DateOffset(months=3)
             prev_date = st.session_state.current_date
             new_date = prev_date + delta
             st.session_state.current_date = new_date
-
             st.info(f"Advanced date to {new_date.date()}")
 
-            # Get last rebalance record
             last = st.session_state.history[-1]
-            tickers = last['assets']
-
-            # 🔥 Download fresh price data for realized window
-            # include new_date by adding 1 day to end (yfinance end is exclusive in some cases)
-            fresh_end = (new_date + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+            tickers_last = last['assets']
             fresh_start = last['date'].strftime("%Y-%m-%d")
+            fresh_end = (new_date + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
 
-            fresh_prices = fetch_prices(
-                tickers=tickers,
-                start=fresh_start,
-                end=fresh_end,
-                auto_adjust=True
-            )
-
-            # If fetch_prices returns a MultiIndex or DataFrame with columns level, handle 'Close' extraction already done in fetch_prices
-            # Ensure tz-naive index (fetch_prices already localizes but be defensive)
+            fresh_prices = fetch_prices(tickers_last, start=fresh_start, end=fresh_end, auto_adjust=True)
+            # ensure tz-naive
             if hasattr(fresh_prices.index, "tz"):
                 try:
                     fresh_prices.index = fresh_prices.index.tz_localize(None)
                 except Exception:
-                    # if already naive, ignore
                     pass
-
-            # forward-fill and drop columns with no data
             fresh_prices = fresh_prices.ffill().dropna(how='all')
 
             if fresh_prices.shape[0] == 0:
                 st.warning("No new price data found between rebalance & new date.")
             else:
-                # Merge fresh_prices into stored price_df so history contains full up-to-date series
-                # Combine the original stored frame and fresh_prices (fresh_prices may overlap existing rows)
+                # merge into stored price_df
                 old_prices = last.get('price_df')
                 if old_prices is None or old_prices.shape[0] == 0:
                     combined_prices = fresh_prices.copy()
                 else:
-                    # concatenate and keep unique index, prefer fresh_prices values for overlapping dates
                     combined = pd.concat([old_prices, fresh_prices])
                     combined = combined[~combined.index.duplicated(keep='last')].sort_index()
                     combined_prices = combined.copy()
 
-                # Save combined (tz-naive ensured)
-                combined_prices.index = combined_prices.index.tz_localize(None) if hasattr(combined_prices.index, "tz") else combined_prices.index
+                # ensure tz-naive
+                if hasattr(combined_prices.index, "tz"):
+                    try:
+                        combined_prices.index = combined_prices.index.tz_localize(None)
+                    except Exception:
+                        pass
+
                 last['price_df'] = combined_prices
 
-                # Compute realized returns using fresh window (strictly > last['date'] and <= new_date)
+                # compute realized returns in (date, new_date]
                 returns_all = compute_log_returns(combined_prices)
                 realized_window = returns_all.loc[(returns_all.index > last['date']) & (returns_all.index <= new_date)]
 
                 if realized_window.shape[0] == 0:
                     st.warning("No return rows found in the realized window after merging fresh data.")
                 else:
-                    # Compute realized P&L
-                    w_smart = last['weights_smart']
-                    w_naive = last['weights_naive']
-
-                    smart_daily = realized_window.dot(w_smart.reindex(realized_window.columns).fillna(0.0))
-                    naive_daily = realized_window.dot(w_naive.reindex(realized_window.columns).fillna(0.0))
-
+                    # Smart
+                    w_smart = last['weights_smart'].reindex(realized_window.columns).fillna(0.0)
+                    smart_daily = realized_window.dot(w_smart)
                     realized_log_smart = float(smart_daily.sum())
-                    realized_log_naive = float(naive_daily.sum())
-
                     realized_return_smart = np.expm1(realized_log_smart)
-                    realized_return_naive = np.expm1(realized_log_naive)
-
                     realized_vol_smart = float(smart_daily.std() * math.sqrt(TRADING_DAYS))
-                    realized_vol_naive = float(naive_daily.std() * math.sqrt(TRADING_DAYS))
-
                     sharpe_smart = realized_return_smart / (realized_vol_smart + 1e-12) if realized_vol_smart > 0 else np.nan
+
+                    # GMM-only
+                    w_gmm = last['weights_gmm_only'].reindex(realized_window.columns).fillna(0.0)
+                    gmm_daily = realized_window.dot(w_gmm)
+                    realized_log_gmm = float(gmm_daily.sum())
+                    realized_return_gmm = np.expm1(realized_log_gmm)
+                    realized_vol_gmm = float(gmm_daily.std() * math.sqrt(TRADING_DAYS))
+                    sharpe_gmm = realized_return_gmm / (realized_vol_gmm + 1e-12) if realized_vol_gmm > 0 else np.nan
+
+                    # PCA-only
+                    w_pca = last['weights_pca_only'].reindex(realized_window.columns).fillna(0.0)
+                    pca_daily = realized_window.dot(w_pca)
+                    realized_log_pca = float(pca_daily.sum())
+                    realized_return_pca = np.expm1(realized_log_pca)
+                    realized_vol_pca = float(pca_daily.std() * math.sqrt(TRADING_DAYS))
+                    sharpe_pca = realized_return_pca / (realized_vol_pca + 1e-12) if realized_vol_pca > 0 else np.nan
+
+                    # Naive
+                    w_naive = last['weights_naive'].reindex(realized_window.columns).fillna(0.0)
+                    naive_daily = realized_window.dot(w_naive)
+                    realized_log_naive = float(naive_daily.sum())
+                    realized_return_naive = np.expm1(realized_log_naive)
+                    realized_vol_naive = float(naive_daily.std() * math.sqrt(TRADING_DAYS))
                     sharpe_naive = realized_return_naive / (realized_vol_naive + 1e-12) if realized_vol_naive > 0 else np.nan
 
-                    # Save realized performance into history record
+                    # write back to record
                     last['realized_return_smart'] = realized_return_smart
-                    last['realized_return_naive'] = realized_return_naive
                     last['realized_vol_smart'] = realized_vol_smart
-                    last['realized_vol_naive'] = realized_vol_naive
                     last['sharpe_smart'] = sharpe_smart
+
+                    last['realized_return_gmm_only'] = realized_return_gmm
+                    last['realized_vol_gmm_only'] = realized_vol_gmm
+                    last['sharpe_gmm_only'] = sharpe_gmm
+
+                    last['realized_return_pca_only'] = realized_return_pca
+                    last['realized_vol_pca_only'] = realized_vol_pca
+                    last['sharpe_pca_only'] = sharpe_pca
+
+                    last['realized_return_naive'] = realized_return_naive
+                    last['realized_vol_naive'] = realized_vol_naive
                     last['sharpe_naive'] = sharpe_naive
 
-                    # Update budget using smart framework realized return
+                    # update budget with Smart realized return
                     prev_budget = st.session_state.budget
-                    new_budget = prev_budget * (1 + realized_return_smart)
-                    st.session_state.budget = float(max(new_budget, 0.0))
+                    st.session_state.budget = float(max(prev_budget * (1 + realized_return_smart), 0.0))
 
-                    st.success(f"Realized smart return = {realized_return_smart:.2%}")
+                    st.success(f"Realized Smart return = {realized_return_smart:.2%}")
                     st.success(f"New budget = ${st.session_state.budget:,.2f}")
-
-
 
 with col2:
     if st.button("Rebalance now (use current budget)"):
-        # allow rebalancing using new budget & (optionally) new tickers in sidebar
         rec = run_pipeline_and_record(st.session_state.current_date, st.session_state.tickers, st.session_state.budget, risk_appetite)
         if rec:
             st.success("Rebalance computed and appended to history.")
@@ -477,9 +504,8 @@ with col2:
 # -------------------------
 st.markdown("## Rebalance History")
 if len(st.session_state.history) == 0:
-    st.info("No rebalances yet. Click 'Run Smart Framework' to start.")
+    st.info("No rebalances yet. Run Smart Framework to start.")
 else:
-    # summary
     rows = []
     for i, e in enumerate(st.session_state.history):
         rows.append({
@@ -488,96 +514,98 @@ else:
             'predicted_regime': e['predicted_regime'],
             'used_fallback': e['used_fallback'],
             'k_keep': e['k_keep'],
-            'forecast_return': e['forecast_port_mu'],
-            'forecast_vol': e['forecast_port_vol'],
+            'forecast_return_smart': e['forecast_port_mu_smart'],
+            'forecast_vol_smart': e['forecast_port_vol_smart'],
             'realized_return_smart': e.get('realized_return_smart'),
             'realized_vol_smart': e.get('realized_vol_smart'),
+            'realized_return_gmm': e.get('realized_return_gmm_only'),
+            'realized_return_pca': e.get('realized_return_pca_only'),
             'realized_return_naive': e.get('realized_return_naive'),
-            'realized_vol_naive': e.get('realized_vol_naive'),
             'sharpe_smart': e.get('sharpe_smart'),
-            'sharpe_naive': e.get('sharpe_naive'),
+            'sharpe_gmm': e.get('sharpe_gmm_only'),
+            'sharpe_pca': e.get('sharpe_pca_only'),
+            'sharpe_naive': e.get('sharpe_naive')
         })
     summary_df = pd.DataFrame(rows).set_index('idx')
-    def fmt_percent(x):
+    def fmt_pct(x):
         return f"{x:.2%}" if pd.notnull(x) else ""
-
-    def fmt_float(x):
+    def fmt_flt(x):
         return f"{x:.3f}" if pd.notnull(x) else ""
-
     st.dataframe(summary_df.style.format({
-        'forecast_return': fmt_percent,
-        'forecast_vol': fmt_percent,
-        'realized_return_smart': fmt_percent,
-        'realized_vol_smart': fmt_percent,
-        'realized_return_naive': fmt_percent,
-        'realized_vol_naive': fmt_percent,
-        'sharpe_smart': fmt_float,
-        'sharpe_naive': fmt_float,
+        'forecast_return_smart': fmt_pct,
+        'forecast_vol_smart': fmt_pct,
+        'realized_return_smart': fmt_pct,
+        'realized_vol_smart': fmt_pct,
+        'realized_return_gmm': fmt_pct,
+        'realized_return_pca': fmt_pct,
+        'realized_return_naive': fmt_pct,
+        'sharpe_smart': fmt_flt,
+        'sharpe_gmm': fmt_flt,
+        'sharpe_pca': fmt_flt,
+        'sharpe_naive': fmt_flt
     }))
 
-    # display last regime probs
-    last = st.session_state.history[-1]
     st.markdown("### Last predicted regime & posterior probabilities")
+    last = st.session_state.history[-1]
     probs = last['regime_probs']
-    probs_df = pd.DataFrame.from_dict(probs, orient='index', columns=['prob'])
-    probs_df = probs_df.reindex(["Bear","Calm","Bull"]).fillna(0.0)
-    st.table(probs_df.style.format({'prob': "{:.2%}"}))
+    probs_df = pd.DataFrame.from_dict(probs, orient='index', columns=['prob']).reindex(["Bear","Calm","Bull"]).fillna(0.0)
+    st.table(probs_df.style.format({'prob': "{:.2%}'}))
     st.bar_chart(probs_df['prob'])
 
-    # performance chart: combine realized segments
-    st.markdown("### Portfolio performance — cumulative (Smart vs 1/N)")
-    
-    # Build continuous cumulative curves
-    smart_log_series = []
-    naive_log_series = []
-    
+    # -------------------------
+    # Cumulative performance for all strategies
+    # -------------------------
+    st.markdown("### Portfolio performance — cumulative (Smart | GMM-only | PCA-only | Naive)")
+    smart_parts = []
+    gmm_parts = []
+    pca_parts = []
+    naive_parts = []
+
     for i, e in enumerate(st.session_state.history):
         prices = e['price_df']
         if prices is None or prices.shape[0] == 0:
             continue
-    
         start_dt = e['date']
-    
-        # End date is the next rebalance OR current data end
         if i+1 < len(st.session_state.history):
             end_dt = st.session_state.history[i+1]['date']
         else:
             end_dt = prices.index[-1]
-    
+
         returns_all = compute_log_returns(prices)
-    
-        # Strict realized window
         interval = returns_all.loc[(returns_all.index > start_dt) & (returns_all.index <= end_dt)]
         if interval.shape[0] == 0:
             continue
-    
-        # Compute daily returns
-        w_smart = e['weights_smart'].reindex(interval.columns).fillna(0.0)
-        w_naive = e['weights_naive'].reindex(interval.columns).fillna(0.0)
-    
-        smart_daily = interval.dot(w_smart)
-        naive_daily = interval.dot(w_naive)
-    
-        smart_log_series.append(smart_daily)
-        naive_log_series.append(naive_daily)
-    
-    # Combine all daily log returns
-    if len(smart_log_series) > 0:
-        smart_all = pd.concat(smart_log_series).sort_index()
-        naive_all = pd.concat(naive_log_series).sort_index()
-    
-        smart_cum = np.exp(smart_all.cumsum()) - 1
-        naive_cum = np.exp(naive_all.cumsum()) - 1
-    
-        perf_df = pd.DataFrame({
-            'Smart': smart_cum,
-            'Naive': naive_cum
-        })
-    
-        st.line_chart(perf_df)
-    else:
-        st.info("No realized periods yet to plot.")
 
+        w_smart = e['weights_smart'].reindex(interval.columns).fillna(0.0)
+        w_gmm = e['weights_gmm_only'].reindex(interval.columns).fillna(0.0)
+        w_pca = e['weights_pca_only'].reindex(interval.columns).fillna(0.0)
+        w_naive = e['weights_naive'].reindex(interval.columns).fillna(0.0)
+
+        smart_daily = interval.dot(w_smart)
+        gmm_daily = interval.dot(w_gmm)
+        pca_daily = interval.dot(w_pca)
+        naive_daily = interval.dot(w_naive)
+
+        smart_parts.append(smart_daily)
+        gmm_parts.append(gmm_daily)
+        pca_parts.append(pca_daily)
+        naive_parts.append(naive_daily)
+
+    if len(smart_parts) > 0:
+        smart_all = pd.concat(smart_parts).sort_index()
+        gmm_all = pd.concat(gmm_parts).sort_index()
+        pca_all = pd.concat(pca_parts).sort_index()
+        naive_all = pd.concat(naive_parts).sort_index()
+
+        perf_df = pd.DataFrame({
+            "Smart": compute_cumulative_from_log(smart_all),
+            "GMM-only": compute_cumulative_from_log(gmm_all),
+            "PCA-only": compute_cumulative_from_log(pca_all),
+            "Naive": compute_cumulative_from_log(naive_all)
+        })
+        st.line_chart(perf_df.fillna(method='ffill').fillna(0.0))
+    else:
+        st.info("No realized performance available yet. Advance time after a rebalance to collect realized returns.")
 
     # Pearson correlations
     st.markdown("### Pearson correlation: predicted μ vs actual asset realized returns")
@@ -593,7 +621,7 @@ else:
             continue
         actual_asset_log = realized_window.sum()
         actual_asset_simple = np.expm1(actual_asset_log)
-        mu_series = e['mu_annual']
+        mu_series = e.get('mu_regime') if e.get('mu_regime') is not None else e.get('mu_full')
         common = actual_asset_simple.index.intersection(mu_series.index)
         if len(common) < 2:
             continue
@@ -609,27 +637,662 @@ else:
     else:
         st.info("No realized data yet for Pearson correlations.")
 
-    # last allocation table
-    st.markdown("### Last allocation (Smart vs 1/N)")
+    # Last allocation table
+    st.markdown("### Last allocation (Smart vs GMM vs PCA vs Naive)")
     last = st.session_state.history[-1]
     alloc_df = pd.DataFrame({
         'Smart_weight': last['weights_smart'],
-        'Smart_alloc': last['alloc_smart'],
+        'GMM_weight': last['weights_gmm_only'],
+        'PCA_weight': last['weights_pca_only'],
         'Naive_weight': last['weights_naive'],
-        'Naive_alloc': last['alloc_naive']
+        'Smart_alloc': (last['weights_smart'] * st.session_state.budget),
+        'Naive_alloc': (last['weights_naive'] * st.session_state.budget)
     }).fillna(0.0)
     st.dataframe(alloc_df.style.format({
         'Smart_weight': '{:.4f}',
-        'Smart_alloc': '{:,.2f}',
+        'GMM_weight': '{:.4f}',
+        'PCA_weight': '{:.4f}',
         'Naive_weight': '{:.4f}',
+        'Smart_alloc': '{:,.2f}',
         'Naive_alloc': '{:,.2f}'
     }))
 
-# -------------------------
-# Footer notes
-# -------------------------
 st.markdown("---")
-st.markdown("**Notes:** GMM uses rolling μ and σ (daily returns). If filtered regime data < 30 observations, we fallback to use all data. PCA denoising uses hybrid RMT / 90% variance rule. Optimization maximizes utility with λ=risk_appetite and constraints sum(w)=1, w>=0.")
+st.markdown("**Notes:** Smart = GMM filter + PCA denoise. GMM-only = GMM filter only (no PCA). PCA-only = full-history PCA denoise (no GMM). Naive = 1/N.")
+
+
+# # app_v2.py
+# import streamlit as st
+# import pandas as pd
+# import numpy as np
+# import yfinance as yf
+# from sklearn.mixture import GaussianMixture
+# from sklearn.preprocessing import StandardScaler
+# from scipy.optimize import minimize
+# from datetime import timedelta
+# import math
+# import matplotlib.pyplot as plt
+# import seaborn as sns
+
+# st.set_page_config(page_title="Smart Framework v2", layout="wide")
+# sns.set_style("whitegrid")
+
+# # -------------------------
+# # Constants
+# # -------------------------
+# TRADING_DAYS = 252
+
+# # -------------------------
+# # Utility functions
+# # -------------------------
+# @st.cache_data
+# def fetch_index_series(ticker, start, end):
+#     """Use .history() for index tickers to avoid yfinance quirks. Fallback to ticker 'SPY' if empty."""
+#     try:
+#         t = yf.Ticker(ticker)
+#         s = t.history(start=start, end=end)['Close'].dropna()
+#         s.index = s.index.tz_localize(None)
+#         if s.empty and ticker.upper() == "^GSPC":
+#             # fallback to SPY
+#             t2 = yf.Ticker("SPY")
+#             s = t2.history(start=start, end=end)['Close'].dropna()
+#         return s
+#     except Exception:
+#         # final fallback: try yf.download
+#         data = yf.download(ticker, start=start, end=end, progress=False)
+#         if 'Close' in data:
+#             return data['Close'].dropna()
+#         return pd.Series(dtype=float)
+
+# @st.cache_data
+# def fetch_prices(tickers, start, end, auto_adjust=True):
+#     """Fetch adjusted close prices for multiple tickers."""
+#     if isinstance(tickers, str):
+#         tickers = [tickers]
+#     df = yf.download(tickers, start=start, end=end, progress=False, auto_adjust=auto_adjust)
+#     # Convert tz-aware index to tz-naive (remove timezone)
+#     df.index = df.index.tz_localize(None)
+
+#     if isinstance(df, pd.DataFrame) and 'Close' in df.columns:
+#         df = df['Close']
+#     if isinstance(df, pd.Series):
+#         df = df.to_frame()
+#     # forward-fill then drop leading NaNs per column
+#     df = df.ffill().dropna(how='all')
+#     return df
+
+# def compute_log_returns(prices):
+#     returns = np.log(prices / prices.shift(1))
+#     return returns.dropna(how='all')
+
+# # -------------------------
+# # Step 0: GMM (2D features μ, σ)
+# # -------------------------
+# def run_step_0_gmm(index_ticker, gmm_start, gmm_end, vol_window=21, k=3):
+#     spx = fetch_index_series(index_ticker, gmm_start, gmm_end)
+#     if spx.empty:
+#         st.error(f"Could not fetch index {index_ticker}. Try 'SPY'.")
+#         return None
+
+#     spx_ret = compute_log_returns(spx)
+#     # rolling features (use simple rolling on daily log returns)
+#     mu_roll = spx_ret# spx_ret.rolling(vol_window).mean()
+#     sigma_roll = spx_ret.rolling(vol_window).std() * math.sqrt(TRADING_DAYS)
+#     features = pd.concat([mu_roll, sigma_roll], axis=1).dropna()
+#     features.columns = ['mu', 'sigma']
+
+#     # scale features, fit GMM
+#     scaler = StandardScaler()
+#     X = scaler.fit_transform(features)
+#     gmm = GaussianMixture(n_components=k, covariance_type='full', random_state=42)
+#     gmm.fit(X)
+#     comp_idx = gmm.predict(X)
+#     probs = gmm.predict_proba(X)  # rows aligned to features.index
+
+#     features = features.assign(component=comp_idx)
+#     # compute component mean (in original mu space) for labeling
+#     comp_means = pd.DataFrame(gmm.means_, columns=['mu_scaled', 'sigma_scaled'])
+#     # To label by mu, we need mapping based on decoded means in original scale:
+#     # inverse transform means
+#     comp_means_orig = pd.DataFrame(scaler.inverse_transform(gmm.means_), columns=['mu', 'sigma'])
+#     order = np.argsort(comp_means_orig['mu'].values)  # ascending mu
+#     # map indices to names
+#     label_map = {}
+#     labels_sorted = ["Bear", "Calm", "Bull"]
+#     for i, comp in enumerate(order):
+#         label_map[comp] = labels_sorted[i] if i < len(labels_sorted) else f"Regime_{i+1}"
+
+#     # historical regime names (aligned to features.index)
+#     hist_labels = pd.Series(comp_idx, index=features.index).map(label_map)
+
+#     # predict current features (most recent rolling mu & sigma)
+#     last_feat = features.iloc[[-1]][['mu', 'sigma']]
+#     last_scaled = scaler.transform(last_feat)
+#     cur_comp = int(gmm.predict(last_scaled)[0])
+#     cur_regime = label_map.get(cur_comp, "Unknown")
+#     # get probabilities for the last row and map to regime names
+#     last_probs = pd.Series(probs[-1], index=[label_map[i] for i in range(len(probs[-1]))])
+#     # ensure ordering Bear/Calm/Bull
+#     probs_map = {name: float(last_probs.get(name, 0.0)) for name in ["Bear", "Calm", "Bull"]}
+
+#     # return: current regime name, probs, features df, historical regime names, label_map, gmm/scaler for debug if needed
+#     return cur_regime, probs_map, features, hist_labels, label_map, gmm, scaler
+
+# # -------------------------
+# # Step 1: get stock inputs (regime-filtered mu and Sigma)
+# # -------------------------
+# def run_step_1_get_inputs(tickers, start_date, end_date, use_gmm=True, current_regime=None, hist_labels=None):
+#     prices = fetch_prices(tickers, start_date, end_date, auto_adjust=True)
+#     if prices.shape[1] == 0:
+#         st.error("No valid price columns returned for tickers.")
+#         return None
+#     returns = compute_log_returns(prices)
+#     if returns.empty:
+#         st.error("No returns available for selected tickers.")
+#         return None
+
+#     if use_gmm and current_regime is not None and hist_labels is not None:
+#         # align labels to returns index (no dropna)
+#         aligned_labels = hist_labels.reindex(returns.index, method='ffill')
+#         mask = aligned_labels.eq(current_regime).fillna(False)
+#         filtered = returns.loc[mask]
+#         used_fallback = False
+#         if filtered.shape[0] < 30:
+#             # fallback
+#             filtered = returns.copy()
+#             used_fallback = True
+#     else:
+#         filtered = returns.copy()
+#         used_fallback = False
+
+#     mu_daily = filtered.mean()
+#     mu_annual = mu_daily * TRADING_DAYS
+#     Sigma_noisy_daily = filtered.cov()
+#     Sigma_noisy = Sigma_noisy_daily * TRADING_DAYS  # annualize
+
+#     sigma_vec = pd.Series(np.sqrt(np.diag(Sigma_noisy)), index=Sigma_noisy.index)
+#     sigma_vec = sigma_vec.replace(0, 1e-8)
+
+#     return mu_annual, Sigma_noisy, sigma_vec, filtered, prices, used_fallback
+
+# # -------------------------
+# # Step 2: PCA denoising (hybrid RMT / 90% var)
+# # -------------------------
+# def run_step_2_pca_denoise(Sigma_noisy, sigma_vector, filtered_returns, var_threshold=0.90):
+#     T = filtered_returns.shape[0]
+#     N = filtered_returns.shape[1]
+#     if T <= 1 or N == 0:
+#         return Sigma_noisy, 0, 0.0
+
+#     # build correlation-like matrix P
+#     D_inv = np.diag(1 / sigma_vector)
+#     P = D_inv @ Sigma_noisy.values @ D_inv
+#     # eigen
+#     vals, vecs = np.linalg.eigh(P)
+#     idx = np.argsort(vals)[::-1]
+#     vals = vals[idx]
+#     vecs = vecs[:, idx]
+#     # RMT threshold (Marchenko-Pastur) using sigma2 = 1 here since P standardized
+#     q = N / T
+#     lambda_plus = (1 + math.sqrt(q))**2 if q > 0 else 0.0
+#     k_rmt = int(np.sum(vals > lambda_plus))
+#     if k_rmt == 0:
+#         k_rmt = 1
+#     # 90% var
+#     cumvar = np.cumsum(vals) / np.sum(vals)
+#     k_var = int(np.searchsorted(cumvar, var_threshold) + 1)
+#     k_keep = max(k_rmt, k_var)
+#     # reconstruct
+#     vals_top = vals[:k_keep]
+#     vecs_top = vecs[:, :k_keep]
+#     P_cleaned = vecs_top @ np.diag(vals_top) @ vecs_top.T
+#     diag_pc = np.diag(P_cleaned).copy()
+#     diag_pc[diag_pc <= 0] = 1e-8
+#     Dp_inv = np.diag(1 / np.sqrt(diag_pc))
+#     P_cleaned = Dp_inv @ P_cleaned @ Dp_inv
+
+#     # unscale
+#     D = np.diag(sigma_vector)
+#     Sigma_cleaned = D @ P_cleaned @ D
+#     Sigma_cleaned = pd.DataFrame(Sigma_cleaned, index=Sigma_noisy.index, columns=Sigma_noisy.columns)
+#     return Sigma_cleaned, k_keep, lambda_plus
+
+# # -------------------------
+# # Step 3: optimizer
+# # -------------------------
+# def run_step_3_optimize(mu, Sigma, lambd):
+#     mu_arr = mu.values
+#     Sigma_arr = Sigma.values
+#     n = len(mu_arr)
+#     def obj(w):
+#         return - (w @ mu_arr - 0.5 * lambd * (w @ (Sigma_arr @ w)))
+#     cons = ({'type':'eq', 'fun': lambda w: np.sum(w) - 1},)
+#     bounds = tuple((0.0, 1.0) for _ in range(n))
+#     x0 = np.repeat(1.0 / n, n)
+#     res = minimize(obj, x0, method='SLSQP', bounds=bounds, constraints=cons, options={'ftol':1e-9, 'maxiter':1000})
+#     if not res.success:
+#         w = np.clip(res.x, 0, None)
+#         if w.sum() <= 0:
+#             w = np.repeat(1.0/n, n)
+#         else:
+#             w = w / w.sum()
+#     else:
+#         w = res.x
+#     w_series = pd.Series(w, index=mu.index)
+#     port_mu = float(w_series @ mu)
+#     port_var = float(w_series @ (Sigma @ w_series))
+#     port_vol = math.sqrt(max(port_var, 0.0))
+#     return w_series, port_mu, port_vol
+
+# # -------------------------
+# # Portfolio helpers
+# # -------------------------
+# def compute_portfolio_daily_returns(weights, daily_returns):
+#     # align weights to daily_returns columns
+#     w = weights.reindex(daily_returns.columns).fillna(0.0)
+#     port = daily_returns.dot(w)
+#     return port
+
+# def compute_cumulative_from_daily(daily_ret):
+#     # daily_ret is log returns; convert to cumulative simple returns series
+#     # sum logs to get log cumulative, then expm1
+#     cum = np.exp(daily_ret.cumsum()) - 1.0
+#     return cum
+
+# # -------------------------
+# # UI & Session state init
+# # -------------------------
+# st.title("Smart Framework — GMM (μ,σ) + PCA Denoised Covariance (Full Simulation)")
+
+# with st.sidebar:
+#     st.header("Controls")
+#     index_ticker = "^GSPC"# st.text_input("Index ticker (GMM)", value="^GSPC")
+#     default_date = pd.to_datetime("2025-01-01")
+#     current_date_input = st.date_input("Current analysis date", value=default_date.date())
+#     risk_appetite = st.slider("Risk appetite (1 Aggressive → 10 Conservative)", 1, 10, 5)
+#     budget_input = st.number_input("Budget", min_value=100.0, value=100000.0, step=100.0, format="%.2f")
+#     # You can customize this list with any universe you want
+#     default_universe = [
+#         "AAPL","MSFT","AMZN","GOOG","META","TSLA","NVDA","JPM","V","XOM",
+#         "NFLX","ADBE","CRM","ORCL","INTC","AMD","BAC","WMT","DIS","CSCO",
+#         "JNJ"
+#     ]
+    
+#     tickers = st.multiselect(
+#         "Select up to 10 stocks",
+#         options=default_universe,
+#         default=["AAPL", "MSFT", "AMZN"],
+#         max_selections=10
+#     )
+    
+#     # Safety: If user selects nothing, block workflow
+#     if len(tickers) == 0:
+#         st.warning("Please select at least 1 stock.")
+    
+#     gmm_lookback_years = 10 #st.number_input("GMM lookback (years)", min_value=3, max_value=20, value=10)
+#     stocks_lookback_years = 5 # st.number_input("Stock history lookback (years)", min_value=1, max_value=10, value=5)
+#     rolling_window_days = 21 # st.number_input("Rolling window (days) for μ,σ", min_value=20, max_value=252, value=60)
+#     advance_period = st.selectbox("Advance time by", ["1 month", "1 quarter (3 months)"])
+#     run_button = st.button("Run Smart Framework (Rebalance now)")
+
+# # initialize session state
+# if 'history' not in st.session_state:
+#     st.session_state.history = []  # list of dicts recording each rebalance
+# if 'current_date' not in st.session_state:
+#     st.session_state.current_date = pd.to_datetime(current_date_input)
+# if 'budget' not in st.session_state:
+#     st.session_state.budget = float(budget_input)
+# if 'tickers' not in st.session_state:
+#     st.session_state.tickers = tickers
+
+# # update session tickers if changed
+# if tickers != st.session_state.tickers:
+#     st.session_state.tickers = tickers
+
+# # -------------------------
+# # Run pipeline (initial rebalance)
+# # -------------------------
+# def run_pipeline_and_record(analysis_date, tickers, budget, risk_appetite):
+#     gmm_start = (pd.to_datetime(analysis_date) - pd.DateOffset(years=int(gmm_lookback_years))).strftime("%Y-%m-%d")
+#     gmm_end = pd.to_datetime(analysis_date).strftime("%Y-%m-%d")
+#     cur_regime, probs_map, features, hist_labels, label_map, gmm_model, scaler = run_step_0_gmm(index_ticker, gmm_start, gmm_end, vol_window=int(rolling_window_days), k=3)
+#     if cur_regime is None:
+#         st.error("GMM failed. Aborting pipeline.")
+#         return None
+
+#     # stock dates
+#     stocks_start = (pd.to_datetime(analysis_date) - pd.DateOffset(years=int(stocks_lookback_years))).strftime("%Y-%m-%d")
+#     stocks_end = pd.to_datetime(analysis_date).strftime("%Y-%m-%d")
+#     mu, Sigma_noisy, sigma_vec, filtered_returns, price_df, used_fallback = run_step_1_get_inputs(st_session_tickers := st.session_state.tickers, stocks_start, stocks_end, use_gmm=True, current_regime=cur_regime, hist_labels=hist_labels)
+#     if mu is None:
+#         st.error("Failed to compute stock inputs.")
+#         return None
+
+#     Sigma_cleaned, k_keep, lambda_plus = run_step_2_pca_denoise(Sigma_noisy, sigma_vec, filtered_returns, var_threshold=0.90)
+
+#     # optimize
+#     w_star, forecast_mu_port, forecast_vol_port = run_step_3_optimize(mu, Sigma_cleaned, lambd=float(risk_appetite))
+#     # naive
+#     assets = list(mu.index)
+#     w_naive = pd.Series(np.repeat(1.0/len(assets), len(assets)), index=assets)
+
+#     # allocations
+#     allocation = (w_star * budget).round(2)
+#     allocation_naive = (w_naive * budget).round(2)
+
+#     # prepare record
+#     record = {
+#         'date': pd.to_datetime(analysis_date),
+#         'predicted_regime': cur_regime,
+#         'regime_probs': probs_map,
+#         'used_fallback': used_fallback,
+#         'assets': assets,
+#         'weights_smart': w_star,
+#         'weights_naive': w_naive,
+#         'alloc_smart': allocation,
+#         'alloc_naive': allocation_naive,
+#         'mu_annual': mu,
+#         'Sigma_annual': Sigma_cleaned,
+#         'k_keep': k_keep,
+#         'lambda_plus': lambda_plus,
+#         'forecast_port_mu': forecast_mu_port,
+#         'forecast_port_vol': forecast_vol_port,
+#         'price_df': price_df,
+#         'filtered_returns': filtered_returns,
+#         # realized placeholders
+#         'realized_return_smart': None,
+#         'realized_vol_smart': None,
+#         'realized_return_naive': None,
+#         'realized_vol_naive': None,
+#         'sharpe_smart': None,
+#         'sharpe_naive': None
+#     }
+#     st.session_state.history.append(record)
+#     return record
+
+# # Bind run_button
+# if run_button:
+#     # reset history on fresh run
+#     st.session_state.history = []
+#     st.session_state.current_date = pd.to_datetime(current_date_input)
+#     st.session_state.budget = float(budget_input)
+#     st.success("Executing Smart Framework...")
+#     rec = run_pipeline_and_record(st.session_state.current_date, st.session_state.tickers, st.session_state.budget, risk_appetite)
+#     if rec:
+#         st.success("Rebalance completed and recorded.")
+
+# # -------------------------
+# # Advance time action
+# # -------------------------
+# col1, col2 = st.columns([1,1])
+# with col1:
+#     if st.button("Advance time"):
+#         if len(st.session_state.history) == 0:
+#             st.warning("No rebalance yet. Click 'Run Smart Framework' first.")
+#         else:
+#             # Advance date
+#             delta = pd.DateOffset(months=1) if advance_period == "1 month" else pd.DateOffset(months=3)
+#             prev_date = st.session_state.current_date
+#             new_date = prev_date + delta
+#             st.session_state.current_date = new_date
+
+#             st.info(f"Advanced date to {new_date.date()}")
+
+#             # Get last rebalance record
+#             last = st.session_state.history[-1]
+#             tickers = last['assets']
+
+#             # 🔥 Download fresh price data for realized window
+#             # include new_date by adding 1 day to end (yfinance end is exclusive in some cases)
+#             fresh_end = (new_date + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+#             fresh_start = last['date'].strftime("%Y-%m-%d")
+
+#             fresh_prices = fetch_prices(
+#                 tickers=tickers,
+#                 start=fresh_start,
+#                 end=fresh_end,
+#                 auto_adjust=True
+#             )
+
+#             # If fetch_prices returns a MultiIndex or DataFrame with columns level, handle 'Close' extraction already done in fetch_prices
+#             # Ensure tz-naive index (fetch_prices already localizes but be defensive)
+#             if hasattr(fresh_prices.index, "tz"):
+#                 try:
+#                     fresh_prices.index = fresh_prices.index.tz_localize(None)
+#                 except Exception:
+#                     # if already naive, ignore
+#                     pass
+
+#             # forward-fill and drop columns with no data
+#             fresh_prices = fresh_prices.ffill().dropna(how='all')
+
+#             if fresh_prices.shape[0] == 0:
+#                 st.warning("No new price data found between rebalance & new date.")
+#             else:
+#                 # Merge fresh_prices into stored price_df so history contains full up-to-date series
+#                 # Combine the original stored frame and fresh_prices (fresh_prices may overlap existing rows)
+#                 old_prices = last.get('price_df')
+#                 if old_prices is None or old_prices.shape[0] == 0:
+#                     combined_prices = fresh_prices.copy()
+#                 else:
+#                     # concatenate and keep unique index, prefer fresh_prices values for overlapping dates
+#                     combined = pd.concat([old_prices, fresh_prices])
+#                     combined = combined[~combined.index.duplicated(keep='last')].sort_index()
+#                     combined_prices = combined.copy()
+
+#                 # Save combined (tz-naive ensured)
+#                 combined_prices.index = combined_prices.index.tz_localize(None) if hasattr(combined_prices.index, "tz") else combined_prices.index
+#                 last['price_df'] = combined_prices
+
+#                 # Compute realized returns using fresh window (strictly > last['date'] and <= new_date)
+#                 returns_all = compute_log_returns(combined_prices)
+#                 realized_window = returns_all.loc[(returns_all.index > last['date']) & (returns_all.index <= new_date)]
+
+#                 if realized_window.shape[0] == 0:
+#                     st.warning("No return rows found in the realized window after merging fresh data.")
+#                 else:
+#                     # Compute realized P&L
+#                     w_smart = last['weights_smart']
+#                     w_naive = last['weights_naive']
+
+#                     smart_daily = realized_window.dot(w_smart.reindex(realized_window.columns).fillna(0.0))
+#                     naive_daily = realized_window.dot(w_naive.reindex(realized_window.columns).fillna(0.0))
+
+#                     realized_log_smart = float(smart_daily.sum())
+#                     realized_log_naive = float(naive_daily.sum())
+
+#                     realized_return_smart = np.expm1(realized_log_smart)
+#                     realized_return_naive = np.expm1(realized_log_naive)
+
+#                     realized_vol_smart = float(smart_daily.std() * math.sqrt(TRADING_DAYS))
+#                     realized_vol_naive = float(naive_daily.std() * math.sqrt(TRADING_DAYS))
+
+#                     sharpe_smart = realized_return_smart / (realized_vol_smart + 1e-12) if realized_vol_smart > 0 else np.nan
+#                     sharpe_naive = realized_return_naive / (realized_vol_naive + 1e-12) if realized_vol_naive > 0 else np.nan
+
+#                     # Save realized performance into history record
+#                     last['realized_return_smart'] = realized_return_smart
+#                     last['realized_return_naive'] = realized_return_naive
+#                     last['realized_vol_smart'] = realized_vol_smart
+#                     last['realized_vol_naive'] = realized_vol_naive
+#                     last['sharpe_smart'] = sharpe_smart
+#                     last['sharpe_naive'] = sharpe_naive
+
+#                     # Update budget using smart framework realized return
+#                     prev_budget = st.session_state.budget
+#                     new_budget = prev_budget * (1 + realized_return_smart)
+#                     st.session_state.budget = float(max(new_budget, 0.0))
+
+#                     st.success(f"Realized smart return = {realized_return_smart:.2%}")
+#                     st.success(f"New budget = ${st.session_state.budget:,.2f}")
+
+
+
+# with col2:
+#     if st.button("Rebalance now (use current budget)"):
+#         # allow rebalancing using new budget & (optionally) new tickers in sidebar
+#         rec = run_pipeline_and_record(st.session_state.current_date, st.session_state.tickers, st.session_state.budget, risk_appetite)
+#         if rec:
+#             st.success("Rebalance computed and appended to history.")
+
+# # -------------------------
+# # Visualizations & Tables
+# # -------------------------
+# st.markdown("## Rebalance History")
+# if len(st.session_state.history) == 0:
+#     st.info("No rebalances yet. Click 'Run Smart Framework' to start.")
+# else:
+#     # summary
+#     rows = []
+#     for i, e in enumerate(st.session_state.history):
+#         rows.append({
+#             'idx': i+1,
+#             'date': e['date'].date(),
+#             'predicted_regime': e['predicted_regime'],
+#             'used_fallback': e['used_fallback'],
+#             'k_keep': e['k_keep'],
+#             'forecast_return': e['forecast_port_mu'],
+#             'forecast_vol': e['forecast_port_vol'],
+#             'realized_return_smart': e.get('realized_return_smart'),
+#             'realized_vol_smart': e.get('realized_vol_smart'),
+#             'realized_return_naive': e.get('realized_return_naive'),
+#             'realized_vol_naive': e.get('realized_vol_naive'),
+#             'sharpe_smart': e.get('sharpe_smart'),
+#             'sharpe_naive': e.get('sharpe_naive'),
+#         })
+#     summary_df = pd.DataFrame(rows).set_index('idx')
+#     def fmt_percent(x):
+#         return f"{x:.2%}" if pd.notnull(x) else ""
+
+#     def fmt_float(x):
+#         return f"{x:.3f}" if pd.notnull(x) else ""
+
+#     st.dataframe(summary_df.style.format({
+#         'forecast_return': fmt_percent,
+#         'forecast_vol': fmt_percent,
+#         'realized_return_smart': fmt_percent,
+#         'realized_vol_smart': fmt_percent,
+#         'realized_return_naive': fmt_percent,
+#         'realized_vol_naive': fmt_percent,
+#         'sharpe_smart': fmt_float,
+#         'sharpe_naive': fmt_float,
+#     }))
+
+#     # display last regime probs
+#     last = st.session_state.history[-1]
+#     st.markdown("### Last predicted regime & posterior probabilities")
+#     probs = last['regime_probs']
+#     probs_df = pd.DataFrame.from_dict(probs, orient='index', columns=['prob'])
+#     probs_df = probs_df.reindex(["Bear","Calm","Bull"]).fillna(0.0)
+#     st.table(probs_df.style.format({'prob': "{:.2%}"}))
+#     st.bar_chart(probs_df['prob'])
+
+#     # performance chart: combine realized segments
+#     st.markdown("### Portfolio performance — cumulative (Smart vs 1/N)")
+    
+#     # Build continuous cumulative curves
+#     smart_log_series = []
+#     naive_log_series = []
+    
+#     for i, e in enumerate(st.session_state.history):
+#         prices = e['price_df']
+#         if prices is None or prices.shape[0] == 0:
+#             continue
+    
+#         start_dt = e['date']
+    
+#         # End date is the next rebalance OR current data end
+#         if i+1 < len(st.session_state.history):
+#             end_dt = st.session_state.history[i+1]['date']
+#         else:
+#             end_dt = prices.index[-1]
+    
+#         returns_all = compute_log_returns(prices)
+    
+#         # Strict realized window
+#         interval = returns_all.loc[(returns_all.index > start_dt) & (returns_all.index <= end_dt)]
+#         if interval.shape[0] == 0:
+#             continue
+    
+#         # Compute daily returns
+#         w_smart = e['weights_smart'].reindex(interval.columns).fillna(0.0)
+#         w_naive = e['weights_naive'].reindex(interval.columns).fillna(0.0)
+    
+#         smart_daily = interval.dot(w_smart)
+#         naive_daily = interval.dot(w_naive)
+    
+#         smart_log_series.append(smart_daily)
+#         naive_log_series.append(naive_daily)
+    
+#     # Combine all daily log returns
+#     if len(smart_log_series) > 0:
+#         smart_all = pd.concat(smart_log_series).sort_index()
+#         naive_all = pd.concat(naive_log_series).sort_index()
+    
+#         smart_cum = np.exp(smart_all.cumsum()) - 1
+#         naive_cum = np.exp(naive_all.cumsum()) - 1
+    
+#         perf_df = pd.DataFrame({
+#             'Smart': smart_cum,
+#             'Naive': naive_cum
+#         })
+    
+#         st.line_chart(perf_df)
+#     else:
+#         st.info("No realized periods yet to plot.")
+
+
+#     # Pearson correlations
+#     st.markdown("### Pearson correlation: predicted μ vs actual asset realized returns")
+#     pearson_rows = []
+#     for i, e in enumerate(st.session_state.history):
+#         if e.get('realized_return_smart') is None:
+#             continue
+#         prices = e['price_df']
+#         reb_date = e['date']
+#         returns_all = compute_log_returns(prices)
+#         realized_window = returns_all.loc[(returns_all.index > reb_date)]
+#         if realized_window.shape[0] == 0:
+#             continue
+#         actual_asset_log = realized_window.sum()
+#         actual_asset_simple = np.expm1(actual_asset_log)
+#         mu_series = e['mu_annual']
+#         common = actual_asset_simple.index.intersection(mu_series.index)
+#         if len(common) < 2:
+#             continue
+#         try:
+#             from scipy.stats import pearsonr
+#             r, p = pearsonr(mu_series.reindex(common).values, actual_asset_simple.reindex(common).values)
+#         except Exception:
+#             r = np.nan
+#         pearson_rows.append({'rebalance': i+1, 'date': e['date'], 'pearson_mu_vs_actual': r})
+#     if len(pearson_rows) > 0:
+#         pearson_df = pd.DataFrame(pearson_rows).set_index('rebalance')
+#         st.dataframe(pearson_df.style.format({'pearson_mu_vs_actual': '{:.3f}'}))
+#     else:
+#         st.info("No realized data yet for Pearson correlations.")
+
+#     # last allocation table
+#     st.markdown("### Last allocation (Smart vs 1/N)")
+#     last = st.session_state.history[-1]
+#     alloc_df = pd.DataFrame({
+#         'Smart_weight': last['weights_smart'],
+#         'Smart_alloc': last['alloc_smart'],
+#         'Naive_weight': last['weights_naive'],
+#         'Naive_alloc': last['alloc_naive']
+#     }).fillna(0.0)
+#     st.dataframe(alloc_df.style.format({
+#         'Smart_weight': '{:.4f}',
+#         'Smart_alloc': '{:,.2f}',
+#         'Naive_weight': '{:.4f}',
+#         'Naive_alloc': '{:,.2f}'
+#     }))
+
+# # -------------------------
+# # Footer notes
+# # -------------------------
+# st.markdown("---")
+# st.markdown("**Notes:** GMM uses rolling μ and σ (daily returns). If filtered regime data < 30 observations, we fallback to use all data. PCA denoising uses hybrid RMT / 90% variance rule. Optimization maximizes utility with λ=risk_appetite and constraints sum(w)=1, w>=0.")
 
 
 
