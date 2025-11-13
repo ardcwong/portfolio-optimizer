@@ -38,7 +38,7 @@ def run_step_0_gmm(index_ticker, start_date, end_date, vol_window, n_components)
     historical_regime_labels = features['regime'].map(regime_map)
     features['Regime Name'] = features['regime'].map(regime_map)
 
-    current_features = feature[['log_return', 'volatility']].iloc[[-1]] 
+    current_features = features[['log_return', 'volatility']].iloc[[-1]] 
     scaled_current_features = scaler.transform(current_features)
     
     current_regime_label = gmm.predict(scaled_current_features)[0]
