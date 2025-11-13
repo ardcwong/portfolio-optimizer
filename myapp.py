@@ -243,11 +243,23 @@ with st.sidebar:
     current_date_input = st.date_input("Current analysis date", value=default_date.date())
     risk_appetite = st.slider("Risk appetite (1 Aggressive → 10 Conservative)", 1, 10, 5)
     budget_input = st.number_input("Budget", min_value=100.0, value=100000.0, step=100.0, format="%.2f")
-    tickers_input = st.text_input("Tickers (comma separated, up to 10)", value="AAPL,MSFT,AMZN,GOOG,TSLA,NVDA")
-    tickers = [t.strip().upper() for t in tickers_input.split(",") if t.strip()]
-    if len(tickers) > 10:
-        tickers = tickers[:10]
-        st.warning("Using first 10 tickers only.")
+    # You can customize this list with any universe you want
+    default_universe = [
+        "AAPL","MSFT","AMZN","GOOG","META","TSLA","NVDA","JPM","V","XOM",
+        "NFLX","ADBE","CRM","ORCL","INTC","AMD","BAC","WMT","DIS","CSCO"
+    ]
+    
+    tickers = st.multiselect(
+        "Select up to 10 stocks",
+        options=default_universe,
+        default=["AAPL", "MSFT", "AMZN"],
+        max_selections=10
+    )
+    
+    # Safety: If user selects nothing, block workflow
+    if len(tickers) == 0:
+        st.warning("Please select at least 1 stock.")
+    
     gmm_lookback_years = st.number_input("GMM lookback (years)", min_value=3, max_value=20, value=10)
     stocks_lookback_years = st.number_input("Stock history lookback (years)", min_value=1, max_value=10, value=5)
     rolling_window_days = st.number_input("Rolling window (days) for μ,σ", min_value=20, max_value=252, value=60)
