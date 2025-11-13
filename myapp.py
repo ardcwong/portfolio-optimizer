@@ -43,7 +43,7 @@ def run_step_0_gmm(index_ticker, start_date, end_date, vol_window, n_components)
     current_regime_name = regime_map[current_regime_label]
     current_regime_probs = dict(zip(["Bear", "Calm", "Bull"], probs[-1]))
 
-    return current_regime_name, current_regime_probs, features, regime_map
+    return current_regime_name, current_regime_probs, features, historical_regime_labels, regime_map
 
 # --- Step 1: Stock Data and Inputs ---
 def run_step_1_get_inputs(stock_tickers, start_date, end_date, use_gmm=True, current_regime=None, hist_labels=None):
@@ -142,7 +142,7 @@ selected_stocks = st.sidebar.multiselect("Select up to 10 Stocks",
 
 if st.sidebar.button("🚀 Run Smart Framework"):
     with st.spinner("Running GMM regime detection..."):
-        current_regime, regime_probs, gmm_features, regime_map = run_step_0_gmm(index_ticker, start_date, end_date, 21, 3)
+        current_regime, regime_probs, gmm_features, historical_regime_labels, regime_map = run_step_0_gmm(index_ticker, start_date, end_date, 21, 3)
         st.success(f"Predicted Current Regime: **{current_regime}**")
         st.write("Regime Probabilities:", regime_probs)
 
