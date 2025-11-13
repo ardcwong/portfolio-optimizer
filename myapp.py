@@ -53,8 +53,19 @@ def run_step_1_get_inputs(stock_tickers, start_date, end_date, use_gmm=True, cur
     log_returns = np.log(stock_prices / stock_prices.shift(1)).dropna()
 
     if use_gmm and current_regime is not None and hist_labels is not None:
-        aligned_labels = hist_labels.reindex(log_returns.index, method='ffill').dropna()
-        filtered_returns = log_returns[aligned_labels == current_regime]
+        # aligned_labels = hist_labels.reindex(log_returns.index, method='ffill').dropna()
+        # filtered_returns = log_returns[aligned_labels == current_regime]
+
+        aligned_labels = hist_labels.reindex(log_returns.index, method='ffill')
+
+        mask = aligned_labels.eq(current_regime)
+        mask = mask.fillna(False)
+
+        filtered_returns = log_returns.loc[mask]
+
+
+
+        
         if len(filtered_returns) < 30:
             filtered_returns = log_returns
     else:
