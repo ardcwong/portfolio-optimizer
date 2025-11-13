@@ -183,10 +183,11 @@ def run_step_2_pca_denoise(Sigma_noisy, sigma_vector, filtered_returns, var_thre
     vals_top = vals[:k_keep]
     vecs_top = vecs[:, :k_keep]
     P_cleaned = vecs_top @ np.diag(vals_top) @ vecs_top.T
-    diag_pc = np.diag(P_cleaned)
+    diag_pc = np.diag(P_cleaned).copy()
     diag_pc[diag_pc <= 0] = 1e-8
     Dp_inv = np.diag(1 / np.sqrt(diag_pc))
     P_cleaned = Dp_inv @ P_cleaned @ Dp_inv
+
     # unscale
     D = np.diag(sigma_vector)
     Sigma_cleaned = D @ P_cleaned @ D
