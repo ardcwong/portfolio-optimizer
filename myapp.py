@@ -13,7 +13,7 @@ TRADING_DAYS = 252
 
 # --- Step 0: GMM Regime Detection ---
 def run_step_0_gmm(index_ticker, start_date, end_date, vol_window, n_components):
-    prices = yf.download(index_ticker, start=start_date, end=end_date, auto_adjust=True)['Close'].dropna()
+    prices = yf.download(index_ticker, start=start_date, end=end_date)['Close'].dropna()
     log_returns = np.log(prices / prices.shift(1))
     rolling_vol = log_returns.rolling(window=vol_window).std() * np.sqrt(TRADING_DAYS)
 
@@ -23,7 +23,7 @@ def run_step_0_gmm(index_ticker, start_date, end_date, vol_window, n_components)
     scaler = StandardScaler()
     scaled_features = scaler.fit_transform(features)
 
-    gmm = GaussianMixture(n_components=n_components, random_state=42)
+    gmm = GaussianMixture(n_components=n_components, covariance_type = 'full', random_state=42)
     gmm.fit(scaled_features)
 
     features['regime'] = gmm.predict(scaled_features)
